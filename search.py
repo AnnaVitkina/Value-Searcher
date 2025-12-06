@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 # HARDCODE YOUR BASE PATH HERE
 # ============================================================
 # For Google Colab with Google Drive:
-BASE_PATH = "/content/drive/MyDrive"
+BASE_PATH = "/content/drive/My Drive"
 
 # For local Windows:
 # BASE_PATH = "C:/Users/avitkin/Documents"
@@ -469,3 +469,4 @@ if __name__ == "__main__":
         
     except Exception as e:
         print(f"An error occurred: {e}")
+
