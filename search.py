@@ -49,6 +49,36 @@ except ImportError:
 SUPPORTED_EXTENSIONS = {'.xlsx', '.xls', '.docx', '.csv'}
 
 
+def convert_windows_path(path: str) -> str:
+    """
+    Convert Windows path to Google Drive compatible path.
+
+    """
+    # Remove common Windows drive prefixes
+    prefixes_to_remove = [
+        r'G:\Shared drives\\',
+        r'G:\Shared drives/',
+        r'G:/Shared drives/',
+        r'G:/Shared drives\\',
+        'G:\\Shared drives\\',
+        'G:/Shared drives/',
+    ]
+    
+    result = path
+    for prefix in prefixes_to_remove:
+        if result.startswith(prefix):
+            result = result[len(prefix):]
+            break
+    
+    # Replace backslashes with forward slashes
+    result = result.replace('\\', '/')
+    
+    # Remove leading/trailing slashes
+    result = result.strip('/')
+    
+    return result
+
+
 @dataclass
 class FolderResult:
     """Represents search results for a final folder."""
@@ -515,7 +545,14 @@ if __name__ == "__main__":
             folder = input(f"     [{path_num}] ➜ ").strip()
             if not folder:
                 break
-            if BASE_PATH and not folder.startswith("/") and not folder.startswith("C:") and not folder.startswith("D:"):
+            
+            # Convert Windows path if needed (e.g., G:\Shared drives\...)
+            if folder.startswith("G:") or "\\" in folder:
+                folder = convert_windows_path(folder)
+                print(f"          → Converted to: {folder}")
+            
+            # Combine with BASE_PATH if set
+            if BASE_PATH and not folder.startswith("/"):
                 full_path = f"{BASE_PATH}/{folder}"
             else:
                 full_path = folder
@@ -543,5 +580,4 @@ if __name__ == "__main__":
         
     except Exception as e:
         print(f"\n  ❌ An error occurred: {e}")
-
 
