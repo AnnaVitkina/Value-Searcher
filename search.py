@@ -8,9 +8,10 @@ import os
 import re
 import warnings
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Suppress openpyxl warnings about missing default styles
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
@@ -108,9 +109,24 @@ def check_dependencies():
     return True
 
 
+# Cache for compiled regex patterns (thread-safe for reading)
+_pattern_cache: dict = {}
+
+
+def get_compiled_pattern(search_value: str) -> re.Pattern:
+    """Get or create a compiled regex pattern for the search value."""
+    if search_value not in _pattern_cache:
+        # Use word boundary regex for exact matching (case insensitive)
+        # \b matches word boundaries (start/end of word)
+        pattern = r'\b' + re.escape(search_value) + r'\b'
+        _pattern_cache[search_value] = re.compile(pattern, re.IGNORECASE)
+    return _pattern_cache[search_value]
+
+
 def is_exact_match(cell_value: str, search_value: str) -> bool:
     """
     Check if search_value is an EXACT match in cell_value (case insensitive).
+    Uses compiled regex for better performance.
     
     Examples:
         is_exact_match("Anna", "anna") -> True
@@ -120,10 +136,8 @@ def is_exact_match(cell_value: str, search_value: str) -> bool:
         is_exact_match("Hello Anna!", "anna") -> True
         is_exact_match("Anna,Bob", "anna") -> True
     """
-    # Use word boundary regex for exact matching (case insensitive)
-    # \b matches word boundaries (start/end of word)
-    pattern = r'\b' + re.escape(search_value) + r'\b'
-    return bool(re.search(pattern, cell_value, re.IGNORECASE))
+    compiled_pattern = get_compiled_pattern(search_value)
+    return bool(compiled_pattern.search(cell_value))
 
 
 def search_in_xlsx(file_path: Path, search_value: str) -> Optional[str]:
@@ -349,55 +363,125 @@ def get_most_recent_file(files: List[Path]) -> Optional[Path]:
     return max(files, key=lambda f: f.stat().st_mtime)
 
 
-def find_all_final_folders(root_paths: List[str]) -> List[Path]:
-    """Find all final folders (folders with no subfolders except 'Old') in the given paths."""
+def scan_single_root(root_path: str) -> Set[Path]:
+    """Scan a single root path for final folders - used for parallel execution."""
     final_folders: Set[Path] = set()
     
+    root_path = root_path.strip()
+    if not root_path:
+        return final_folders
+        
+    root = Path(root_path)
+    
+    if not root.exists() or not root.is_dir():
+        return final_folders
+    
+    # Use os.walk for faster traversal with directory skipping
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        
+        # Remove skip folders from dirnames to prevent descending into them
+        # This is the key optimization - os.walk won't enter these folders
+        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_FOLDERS]
+        
+        # Check if current folder has no non-skip subdirectories (is final)
+        if not dirnames:  # No subdirectories left after filtering
+            final_folders.add(current)
+    
+    return final_folders
+
+
+def find_all_final_folders(root_paths: List[str]) -> List[Path]:
+    """Find all final folders using parallel scanning of root paths."""
+    all_final_folders: Set[Path] = set()
+    valid_paths = []
+    
+    # Validate paths first
     for root_path in root_paths:
         root_path = root_path.strip()
         if not root_path:
             continue
-            
         root = Path(root_path)
-        
         if not root.exists():
-            print(f"Warning: Folder not found: {root_path}")
+            print(f"  ⚠️  Warning: Folder not found: {root_path}")
             continue
-        
         if not root.is_dir():
-            print(f"Warning: Path is not a directory: {root_path}")
+            print(f"  ⚠️  Warning: Path is not a directory: {root_path}")
             continue
-        
-        print(f"  📂 Scanning: {root_path}")
-        
-        for folder in root.rglob('*'):
-            if folder.is_dir():
-                # Skip folders in the skip list (test, bug, feasibility, old)
-                if is_skip_folder(folder):
-                    continue
-                # Skip if any parent is a skip folder
-                skip = False
-                for parent in folder.parents:
-                    if is_skip_folder(parent):
-                        skip = True
-                        break
-                if skip:
-                    continue
-                
-                if is_final_folder(folder):
-                    final_folders.add(folder)
-        
-        if is_final_folder(root):
-            final_folders.add(root)
+        valid_paths.append(root_path)
+        print(f"  📂 Queued for scanning: {root_path}")
     
-    return sorted(final_folders, key=lambda f: str(f).lower())
+    if not valid_paths:
+        return []
+    
+    print(f"\n  ⚡ Scanning {len(valid_paths)} path(s) in parallel...")
+    
+    # Scan all root paths in parallel
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(scan_single_root, path): path for path in valid_paths}
+        
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                folders = future.result()
+                all_final_folders.update(folders)
+                print(f"  ✓ Scanned: {Path(path).name} ({len(folders)} folders found)")
+            except Exception as e:
+                print(f"  ✗ Error scanning {path}: {e}")
+    
+    return sorted(all_final_folders, key=lambda f: str(f).lower())
+
+
+# Number of parallel workers for file searching
+# - Local SSD: 4-8 workers
+# - Local HDD: 4-6 workers  
+# - Network/Google Drive: 16-32 workers (more I/O latency = more parallelism helps)
+MAX_WORKERS = 16
+
+
+def process_single_folder(folder: Path, search_value: str) -> Optional[FolderResult]:
+    """Process a single folder - used for parallel execution."""
+    files = get_supported_files(folder)
+    all_file_names = sorted([f.name for f in files])
+    
+    # Skip empty folders (no supported files)
+    if not files:
+        return None
+    
+    most_recent = get_most_recent_file(files)
+    
+    if most_recent:
+        mod_time = datetime.fromtimestamp(most_recent.stat().st_mtime)
+        mod_time_str = mod_time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        search_result = search_in_file(most_recent, search_value)
+        
+        return FolderResult(
+            folder_name=folder.name,
+            folder_path=str(folder),
+            all_files=all_file_names,
+            searched_file=most_recent.name,
+            searched_file_modified=mod_time_str,
+            search_found=search_result is not None,
+            search_details=search_result
+        )
+    else:
+        return FolderResult(
+            folder_name=folder.name,
+            folder_path=str(folder),
+            all_files=all_file_names,
+            searched_file=None,
+            searched_file_modified=None,
+            search_found=False,
+            search_details=None
+        )
 
 
 def search_in_final_folders(
     search_value: str,
     folder_paths: List[str]
 ) -> List[FolderResult]:
-    """Search for EXACT value match in final folders."""
+    """Search for EXACT value match in final folders using parallel processing."""
     
     results: List[FolderResult] = []
     final_folders = find_all_final_folders(folder_paths)
@@ -406,48 +490,36 @@ def search_in_final_folders(
         print("\n  ⚠️  No final folders found.")
         return results
     
-    print(f"\n  📊 Found {len(final_folders)} final folder(s) to process...")
+    total = len(final_folders)
+    print(f"\n  📊 Found {total} final folder(s) to process...")
+    print(f"  ⚡ Using {MAX_WORKERS} parallel workers for faster search")
     print()
     
-    for idx, folder in enumerate(final_folders, 1):
-        progress = int((idx / len(final_folders)) * 20)
-        bar = "█" * progress + "░" * (20 - progress)
-        print(f"  ⏳ [{bar}] {idx}/{len(final_folders)} - {folder.name[:30]}", end='\r')
+    completed = 0
+    
+    # Use ThreadPoolExecutor for parallel file searching
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_folder = {
+            executor.submit(process_single_folder, folder, search_value): folder 
+            for folder in final_folders
+        }
         
-        files = get_supported_files(folder)
-        all_file_names = sorted([f.name for f in files])
-        
-        # Skip empty folders (no supported files)
-        if not files:
-            continue
-        
-        most_recent = get_most_recent_file(files)
-        
-        if most_recent:
-            mod_time = datetime.fromtimestamp(most_recent.stat().st_mtime)
-            mod_time_str = mod_time.strftime("%Y-%m-%d %H:%M:%S")
+        # Collect results as they complete
+        for future in as_completed(future_to_folder):
+            completed += 1
+            progress = int((completed / total) * 20)
+            bar = "█" * progress + "░" * (20 - progress)
+            folder = future_to_folder[future]
+            print(f"  ⏳ [{bar}] {completed}/{total} - {folder.name[:30]:<30}", end='\r')
             
-            search_result = search_in_file(most_recent, search_value)
-            
-            results.append(FolderResult(
-                folder_name=folder.name,
-                folder_path=str(folder),
-                all_files=all_file_names,
-                searched_file=most_recent.name,
-                searched_file_modified=mod_time_str,
-                search_found=search_result is not None,
-                search_details=search_result
-            ))
-        else:
-            results.append(FolderResult(
-                folder_name=folder.name,
-                folder_path=str(folder),
-                all_files=all_file_names,
-                searched_file=None,
-                searched_file_modified=None,
-                search_found=False,
-                search_details=None
-            ))
+            try:
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+            except Exception:
+                # Skip folders that cause errors
+                pass
     
     print()
     return results
@@ -516,6 +588,7 @@ if __name__ == "__main__":
     print("  ║   📄 Searches in Excel, Word (.docx), and CSV files              ")
     print("  ║   📂 Shows all files, searches the most recent one                ")
     print("  ║   🚫 Skips subfolders: Old, test, bug, feasibility                 ")
+    print("  ║   ⚡ Parallel processing for faster search                        ")
     print("  ║                                                                   ")
     print("  ╚═══════════════════════════════════════════════════════════════════")
     print()
