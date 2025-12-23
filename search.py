@@ -300,16 +300,25 @@ def search_in_file(file_path: Path, search_value: str) -> Optional[str]:
     return None
 
 
+# Folders to skip during search (case-insensitive)
+SKIP_FOLDERS = {'old', 'test', 'bug', 'feasibility'}
+
+
+def is_skip_folder(folder: Path) -> bool:
+    """Check if folder should be skipped (case-insensitive)."""
+    return folder.name.lower() in SKIP_FOLDERS
+
+
 def is_old_folder(folder: Path) -> bool:
-    """Check if folder is named 'Old' (case-insensitive)."""
+    """Check if folder is named 'Old' (case-insensitive). Kept for backwards compatibility."""
     return folder.name.lower() == 'old'
 
 
-def has_non_old_subfolders(folder: Path) -> bool:
-    """Check if folder has any subfolders (excluding 'Old' folders)."""
+def has_non_skip_subfolders(folder: Path) -> bool:
+    """Check if folder has any subfolders (excluding skip folders like 'Old', 'test', etc.)."""
     try:
         for item in folder.iterdir():
-            if item.is_dir() and not is_old_folder(item):
+            if item.is_dir() and not is_skip_folder(item):
                 return True
     except PermissionError:
         pass
@@ -317,8 +326,8 @@ def has_non_old_subfolders(folder: Path) -> bool:
 
 
 def is_final_folder(folder: Path) -> bool:
-    """Check if folder is a 'final' folder (has no subfolders except possibly 'Old')."""
-    return not has_non_old_subfolders(folder)
+    """Check if folder is a 'final' folder (has no subfolders except possibly skip folders)."""
+    return not has_non_skip_subfolders(folder)
 
 
 def get_supported_files(folder: Path) -> List[Path]:
@@ -363,11 +372,13 @@ def find_all_final_folders(root_paths: List[str]) -> List[Path]:
         
         for folder in root.rglob('*'):
             if folder.is_dir():
-                if is_old_folder(folder):
+                # Skip folders in the skip list (test, bug, feasibility, old)
+                if is_skip_folder(folder):
                     continue
+                # Skip if any parent is a skip folder
                 skip = False
                 for parent in folder.parents:
-                    if is_old_folder(parent):
+                    if is_skip_folder(parent):
                         skip = True
                         break
                 if skip:
@@ -406,16 +417,8 @@ def search_in_final_folders(
         files = get_supported_files(folder)
         all_file_names = sorted([f.name for f in files])
         
+        # Skip empty folders (no supported files)
         if not files:
-            results.append(FolderResult(
-                folder_name=folder.name,
-                folder_path=str(folder),
-                all_files=[],
-                searched_file=None,
-                searched_file_modified=None,
-                search_found=False,
-                search_details=None
-            ))
             continue
         
         most_recent = get_most_recent_file(files)
@@ -512,7 +515,7 @@ if __name__ == "__main__":
     print("  ║                                                                   ")
     print("  ║   📄 Searches in Excel, Word (.docx), and CSV files              ")
     print("  ║   📂 Shows all files, searches the most recent one                ")
-    print("  ║   🚫 Skips subfolders named 'Old'                                 ")
+    print("  ║   🚫 Skips subfolders: Old, test, bug, feasibility                 ")
     print("  ║                                                                   ")
     print("  ╚═══════════════════════════════════════════════════════════════════")
     print()
@@ -580,5 +583,4 @@ if __name__ == "__main__":
         
     except Exception as e:
         print(f"\n  ❌ An error occurred: {e}")
-
 
