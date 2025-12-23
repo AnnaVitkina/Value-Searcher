@@ -363,38 +363,43 @@ def get_most_recent_file(files: List[Path]) -> Optional[Path]:
     return max(files, key=lambda f: f.stat().st_mtime)
 
 
-def scan_single_root(root_path: str) -> Set[Path]:
-    """Scan a single root path for final folders - used for parallel execution."""
+def scan_subtree(root: Path) -> Set[Path]:
+    """Scan a subtree for final folders - used for parallel execution."""
     final_folders: Set[Path] = set()
-    
-    root_path = root_path.strip()
-    if not root_path:
-        return final_folders
-        
-    root = Path(root_path)
     
     if not root.exists() or not root.is_dir():
         return final_folders
     
-    # Use os.walk for faster traversal with directory skipping
+    # Use os.walk for traversal with directory skipping
     for dirpath, dirnames, filenames in os.walk(root):
         current = Path(dirpath)
         
         # Remove skip folders from dirnames to prevent descending into them
-        # This is the key optimization - os.walk won't enter these folders
         dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_FOLDERS]
         
         # Check if current folder has no non-skip subdirectories (is final)
-        if not dirnames:  # No subdirectories left after filtering
+        if not dirnames:
             final_folders.add(current)
     
     return final_folders
 
 
+def get_top_level_subdirs(root: Path) -> List[Path]:
+    """Get immediate subdirectories of a path (excluding skip folders)."""
+    subdirs = []
+    try:
+        for item in root.iterdir():
+            if item.is_dir() and item.name.lower() not in SKIP_FOLDERS:
+                subdirs.append(item)
+    except PermissionError:
+        pass
+    return subdirs
+
+
 def find_all_final_folders(root_paths: List[str]) -> List[Path]:
-    """Find all final folders using parallel scanning of root paths."""
+    """Find all final folders using parallel scanning."""
     all_final_folders: Set[Path] = set()
-    valid_paths = []
+    valid_roots = []
     
     # Validate paths first
     for root_path in root_paths:
@@ -408,26 +413,54 @@ def find_all_final_folders(root_paths: List[str]) -> List[Path]:
         if not root.is_dir():
             print(f"  ⚠️  Warning: Path is not a directory: {root_path}")
             continue
-        valid_paths.append(root_path)
+        valid_roots.append(root)
         print(f"  📂 Queued for scanning: {root_path}")
     
-    if not valid_paths:
+    if not valid_roots:
         return []
     
-    print(f"\n  ⚡ Scanning {len(valid_paths)} path(s) in parallel...")
+    # Collect all subtrees to scan in parallel
+    # This gives parallelism even with a single root path
+    subtrees_to_scan: List[Path] = []
     
-    # Scan all root paths in parallel
+    for root in valid_roots:
+        top_subdirs = get_top_level_subdirs(root)
+        if top_subdirs:
+            # Has subdirectories - add them for parallel scanning
+            subtrees_to_scan.extend(top_subdirs)
+        else:
+            # Root itself is a final folder
+            all_final_folders.add(root)
+    
+    if not subtrees_to_scan:
+        return sorted(all_final_folders, key=lambda f: str(f).lower())
+    
+    print(f"\n  ⚡ Scanning {len(subtrees_to_scan)} subtrees in parallel...")
+    
+    # Scan all subtrees in parallel
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(scan_single_root, path): path for path in valid_paths}
+        futures = {executor.submit(scan_subtree, subtree): subtree for subtree in subtrees_to_scan}
         
+        completed = 0
+        total = len(futures)
         for future in as_completed(futures):
-            path = futures[future]
+            completed += 1
+            subtree = futures[future]
             try:
                 folders = future.result()
                 all_final_folders.update(folders)
-                print(f"  ✓ Scanned: {Path(path).name} ({len(folders)} folders found)")
-            except Exception as e:
-                print(f"  ✗ Error scanning {path}: {e}")
+                # Show progress
+                if total > 10:
+                    progress = int((completed / total) * 20)
+                    bar = "█" * progress + "░" * (20 - progress)
+                    print(f"  ⏳ [{bar}] {completed}/{total} subtrees scanned", end='\r')
+            except Exception:
+                pass
+    
+    if total > 10:
+        print()  # New line after progress bar
+    
+    print(f"  ✓ Found {len(all_final_folders)} final folders")
     
     return sorted(all_final_folders, key=lambda f: str(f).lower())
 
