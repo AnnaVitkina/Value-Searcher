@@ -1,6 +1,7 @@
 """
 File Search Utility - EXACT MATCH (Case Insensitive)
-Searches for EXACT word matches inside Excel (.xlsx, .xls), Word (.docx), and CSV files.
+Searches for EXACT word matches inside Excel (.xlsx, .xls), Word (.docx), CSV files,
+and Google Docs (.gdoc) / Google Sheets (.gsheet) files.
 Example: searching for "Anna" will find "anna", "Anna" but NOT "Joanna" or "annabel"
 """
 
@@ -45,9 +46,235 @@ try:
 except ImportError:
     Document = None
 
+# Google API support (for Google Docs and Sheets)
+import json
+
+try:
+    from google.colab import auth
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    GOOGLE_API_AVAILABLE = True
+except ImportError:
+    GOOGLE_API_AVAILABLE = False
+    auth = None
+    build = None
+    HttpError = None
+
+# Google API service objects (initialized lazily)
+_sheets_service = None
+_docs_service = None
+_drive_service = None
+_google_credentials = None
+_google_authenticated = False
+
+
+def init_google_services(silent: bool = False):
+    """Initialize Google API services (authenticate once, reuse services).
+    
+    SECURITY: Uses READ-ONLY scopes only - cannot modify or delete any files.
+    
+    Args:
+        silent: If True, don't print any messages
+    """
+    global _sheets_service, _docs_service, _drive_service, _google_credentials, _google_authenticated
+    
+    if not GOOGLE_API_AVAILABLE:
+        return False
+    
+    if _google_authenticated:
+        return True
+    
+    try:
+        if not silent:
+            print("\n  🔐 Google file detected - requesting READ-ONLY API access...")
+        
+        # Authenticate with Google using READ-ONLY scopes
+        # These scopes CANNOT modify, delete, or create any files
+        from google.colab import auth as colab_auth
+        colab_auth.authenticate_user()
+        
+        # Import credentials with explicit READ-ONLY scopes
+        import google.auth
+        READONLY_SCOPES = [
+            'https://www.googleapis.com/auth/drive.readonly',         # Read-only Drive access
+            'https://www.googleapis.com/auth/spreadsheets.readonly',  # Read-only Sheets
+            'https://www.googleapis.com/auth/documents.readonly',     # Read-only Docs
+        ]
+        
+        credentials, project = google.auth.default(scopes=READONLY_SCOPES)
+        _google_credentials = credentials
+        
+        # Build ALL service objects with read-only credentials
+        _drive_service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
+        _sheets_service = build('sheets', 'v4', credentials=credentials, cache_discovery=False)
+        _docs_service = build('docs', 'v1', credentials=credentials, cache_discovery=False)
+        
+        _google_authenticated = True
+        if not silent:
+            print("  ✓ Authenticated (READ-ONLY mode) - your files are safe\n")
+        return True
+    except Exception as e:
+        if not silent:
+            print(f"  ⚠️  Google API authentication failed: {e}\n")
+        return False
+
+
+def search_in_gsheet(file_path: Path, search_value: str) -> Optional[str]:
+    """Search for EXACT value match inside a Google Sheet using Google Sheets API.
+    
+    SECURITY: Uses READ-ONLY API access.
+    """
+    global _sheets_service, _drive_service
+    
+    if not init_google_services():
+        return None
+    
+    # Get file name (without extension) to search by title
+    file_name = file_path.stem
+    
+    try:
+        # Search for the file using READ-ONLY Drive API
+        query = f"name = '{file_name}' and mimeType = 'application/vnd.google-apps.spreadsheet'"
+        results = _drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name)',
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        
+        files = results.get('files', [])
+        
+        if not files:
+            return None
+        
+        file_id = files[0]['id']
+        
+        # Get spreadsheet data using READ-ONLY Sheets API
+        spreadsheet = _sheets_service.spreadsheets().get(spreadsheetId=file_id).execute()
+        sheets = spreadsheet.get('sheets', [])
+        
+        matches = []
+        
+        for sheet in sheets:
+            sheet_name = sheet['properties']['title']
+            
+            # Read all values from the sheet
+            range_name = f"'{sheet_name}'"
+            result = _sheets_service.spreadsheets().values().get(
+                spreadsheetId=file_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            for row_idx, row in enumerate(values, 1):
+                for col_idx, cell_value in enumerate(row):
+                    if cell_value:
+                        if is_exact_match(str(cell_value), search_value):
+                            # Convert to Excel-like column letter
+                            col_letter = ""
+                            col_num = col_idx + 1
+                            while col_num > 0:
+                                col_num, remainder = divmod(col_num - 1, 26)
+                                col_letter = chr(65 + remainder) + col_letter
+                            matches.append(f"Sheet '{sheet_name}', Cell {col_letter}{row_idx}")
+        
+        if matches:
+            return "; ".join(matches[:5]) + (f" (+{len(matches)-5} more)" if len(matches) > 5 else "")
+        return None
+        
+    except HttpError:
+        return None
+    except Exception:
+        return None
+
+
+def search_in_gdoc(file_path: Path, search_value: str) -> Optional[str]:
+    """Search for EXACT value match inside a Google Doc using Google Docs API.
+    
+    SECURITY: Uses READ-ONLY API access.
+    """
+    global _docs_service, _drive_service
+    
+    if not init_google_services():
+        return None
+    
+    # Get file name (without extension) to search by title
+    file_name = file_path.stem
+    
+    try:
+        # Search for the file using READ-ONLY Drive API
+        query = f"name = '{file_name}' and mimeType = 'application/vnd.google-apps.document'"
+        results = _drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name)',
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        
+        files = results.get('files', [])
+        
+        if not files:
+            return None
+        
+        file_id = files[0]['id']
+        
+        # Get document content using READ-ONLY Docs API
+        document = _docs_service.documents().get(documentId=file_id).execute()
+        
+        matches = []
+        
+        # Extract text from body content
+        body = document.get('body', {})
+        content = body.get('content', [])
+        
+        paragraph_num = 0
+        for element in content:
+            if 'paragraph' in element:
+                paragraph_num += 1
+                paragraph = element['paragraph']
+                elements = paragraph.get('elements', [])
+                
+                para_text = ""
+                for elem in elements:
+                    if 'textRun' in elem:
+                        para_text += elem['textRun'].get('content', '')
+                
+                if para_text and is_exact_match(para_text, search_value):
+                    preview = para_text[:50].replace('\n', ' ') + "..." if len(para_text) > 50 else para_text.replace('\n', ' ')
+                    matches.append(f"Paragraph {paragraph_num}: '{preview}'")
+            
+            elif 'table' in element:
+                table = element['table']
+                table_rows = table.get('tableRows', [])
+                
+                for row_idx, row in enumerate(table_rows):
+                    cells = row.get('tableCells', [])
+                    for cell_idx, cell in enumerate(cells):
+                        cell_content = cell.get('content', [])
+                        cell_text = ""
+                        for cell_elem in cell_content:
+                            if 'paragraph' in cell_elem:
+                                for elem in cell_elem['paragraph'].get('elements', []):
+                                    if 'textRun' in elem:
+                                        cell_text += elem['textRun'].get('content', '')
+                        
+                        if cell_text and is_exact_match(cell_text, search_value):
+                            matches.append(f"Table Row {row_idx + 1}, Cell {cell_idx + 1}")
+        
+        if matches:
+            return "; ".join(matches[:5]) + (f" (+{len(matches)-5} more)" if len(matches) > 5 else "")
+        return None
+        
+    except HttpError:
+        return None
+    except Exception:
+        return None
+
 
 # Supported file extensions
-SUPPORTED_EXTENSIONS = {'.xlsx', '.xls', '.docx', '.csv'}
+SUPPORTED_EXTENSIONS = {'.xlsx', '.xls', '.docx', '.csv', '.gsheet', '.gdoc'}
 
 
 def convert_windows_path(path: str) -> str:
@@ -106,6 +333,7 @@ def check_dependencies():
         print("Missing required libraries. Install them with:")
         print(f"  pip install {' '.join(missing)}")
         return False
+    
     return True
 
 
@@ -310,6 +538,10 @@ def search_in_file(file_path: Path, search_value: str) -> Optional[str]:
         return search_in_docx(file_path, search_value)
     elif extension == '.csv':
         return search_in_csv(file_path, search_value)
+    elif extension == '.gsheet':
+        return search_in_gsheet(file_path, search_value)
+    elif extension == '.gdoc':
+        return search_in_gdoc(file_path, search_value)
     
     return None
 
@@ -514,7 +746,7 @@ def search_in_final_folders(
     search_value: str,
     folder_paths: List[str]
 ) -> List[FolderResult]:
-    """Search for EXACT value match in final folders using parallel processing."""
+    """Search for EXACT value match in final folders."""
     
     results: List[FolderResult] = []
     final_folders = find_all_final_folders(folder_paths)
@@ -524,37 +756,23 @@ def search_in_final_folders(
         return results
     
     total = len(final_folders)
-    print(f"\n  📊 Found {total} final folder(s) to process...")
-    print(f"  ⚡ Using {MAX_WORKERS} parallel workers for faster search")
-    print()
+    print(f"\n  🔍 Searching {total} folder(s)...")
     
-    completed = 0
-    
-    # Use ThreadPoolExecutor for parallel file searching
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all tasks
-        future_to_folder = {
-            executor.submit(process_single_folder, folder, search_value): folder 
-            for folder in final_folders
-        }
-        
-        # Collect results as they complete
-        for future in as_completed(future_to_folder):
-            completed += 1
-            progress = int((completed / total) * 20)
-            bar = "█" * progress + "░" * (20 - progress)
-            folder = future_to_folder[future]
-            print(f"  ⏳ [{bar}] {completed}/{total} - {folder.name[:30]:<30}", end='\r')
+    # Process folders with progress bar
+    for idx, folder in enumerate(final_folders, 1):
+        try:
+            # Show progress bar
+            progress = int((idx / total) * 30)
+            bar = "█" * progress + "░" * (30 - progress)
+            print(f"\r  ⏳ [{bar}] {idx}/{total}", end="", flush=True)
             
-            try:
-                result = future.result()
-                if result is not None:
-                    results.append(result)
-            except Exception:
-                # Skip folders that cause errors
-                pass
+            result = process_single_folder(folder, search_value)
+            if result is not None:
+                results.append(result)
+        except Exception:
+            pass  # Skip folders with errors silently
     
-    print()
+    print(f"\r  ✓ Searched {total} folder(s)" + " " * 20)
     return results
 
 
@@ -618,7 +836,7 @@ if __name__ == "__main__":
     print("  ║                                                                   ")
     print("  ║   🎯  SEARCH UTILITY                                             ")
     print("  ║                                                                   ")
-    print("  ║   📄 Searches in Excel, Word (.docx), and CSV files              ")
+    print("  ║   📄 Searches in Excel, Word, CSV, Google Docs & Sheets          ")
     print("  ║   📂 Shows all files, searches the most recent one                ")
     print("  ║   🚫 Skips subfolders: Old, test, bug, feasibility                 ")
     print("  ║   ⚡ Parallel processing for faster search                        ")
